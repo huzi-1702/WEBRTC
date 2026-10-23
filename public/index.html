@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="vi" translate="no">
+    <head>
+  <meta charset="utf-8">
+    <meta name="google" content="notranslate">
+  <title>MeetLite</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .videos { display: flex; gap: 8px; flex-wrap: wrap; }
+    video { width: 320px; background: #000; border-radius: 8px; }
+    #status { margin: 12px 0; font: 14px monospace; }
+    #log {
+      height: 280px; overflow: auto; background: #111; color: #0f0;
+      font: 12px/1.5 monospace; padding: 8px; border-radius: 8px; white-space: pre-wrap;
+    }
+    button { margin-right: 8px; padding: 6px 12px; }
+  </style>
+</head>
+<body>
+  <div class="videos">
+    <video id="local" autoplay muted playsinline></video>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+
+  <div id="status"></div>
+  <div>
+    <button id="btnSdp">In SDP ra log</button>
+    <button id="btnClear">Xóa log</button>
+  </div>
+  <div id="log"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const room = 'demo';
+    const socket = io();
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+
+    // ---------- Debug Panel ----------
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+    const t0 = performance.now();
+
+    function log(msg) {
+      const ms = String(Math.round(performance.now() - t0)).padStart(6, ' ');
+      logEl.textContent += `[+${ms} ms] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function parseCandidate(c) {
+    const p = (c.candidate || '').split(' ');
+    return { protocol: p[2], address: p[4], port: p[5], type: p[7] };
+    }
+
+    function renderStatus() {
+      statusEl.textContent =
+        `signaling: ${pc.signalingState} | ice gathering: ${pc.iceGatheringState} | ` +
+        `ice: ${pc.iceConnectionState} | connection: ${pc.connectionState}`;
+    }
+    renderStatus();
+
+    document.getElementById('btnClear').onclick = () => { logEl.textContent = ''; };
+    document.getElementById('btnSdp').onclick = () => {
+      log('--- Local SDP ---\n' + (pc.localDescription ? pc.localDescription.sdp : '(chưa có)'));
+      log('--- Remote SDP ---\n' + (pc.remoteDescription ? pc.remoteDescription.sdp : '(chưa có)'));
+    };
+
+    async function logSelectedPair() {
+      const stats = await pc.getStats();
+      let pair;
+      stats.forEach((r) => {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
+      });
+      if (!pair) return log('Chưa tìm thấy candidate pair được chọn');
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      log(`Selected pair: local=${local.candidateType}/${local.protocol} <-> ` +
+          `remote=${remote.candidateType}/${remote.protocol}, RTT=${pair.currentRoundTripTime}s`);
+    }
+
+    // ---------- Sự kiện WebRTC ----------
+    pc.onsignalingstatechange = () => { log(`signalingState: ${pc.signalingState}`); renderStatus(); };
+    pc.onicegatheringstatechange = () => { log(`iceGatheringState: ${pc.iceGatheringState}`); renderStatus(); };
+    pc.oniceconnectionstatechange = () => { log(`iceConnectionState: ${pc.iceConnectionState}`); renderStatus(); };
+    pc.onconnectionstatechange = () => {
+      log(`connectionState: ${pc.connectionState}`);
+      renderStatus();
+      if (pc.connectionState === 'connected') logSelectedPair();
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        const c = e.candidate;
+        log(`Local ICE candidate: type=${c.type} protocol=${c.protocol} address=${c.address}:${c.port}`);
+        socket.emit('ice-candidate', { room, candidate: c });
+      } else {
+        log('Local ICE gathering finished');
+      }
+    };
+
+    pc.ontrack = (e) => {
+      log(`Nhận track từ xa: kind=${e.track.kind}`);
+      document.getElementById('remote').srcObject = e.streams[0];
+    };
+
+    // ---------- Xếp hàng ICE candidate đến sớm ----------
+    let remoteSet = false;
+    const pending = [];
+    async function addRemoteCandidate(c) {
+      if (!remoteSet) return pending.push(c);
+      try { await pc.addIceCandidate(c); } catch (err) { log('addIceCandidate lỗi: ' + err); }
+    }
+    async function flushPending() {
+      remoteSet = true;
+      for (const c of pending) await addRemoteCandidate(c);
+      pending.length = 0;
+    }
+
+    // ---------- Camera / micro ----------
+    (async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      document.getElementById('local').srcObject = stream;
+      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+      log('Đã lấy camera/micro, tham gia phòng: ' + room);
+      socket.emit('join', room);
+    })();
+
+    // ---------- Signaling ----------
+    socket.on('full', () => log('Phòng đã đầy (tối đa 2 người)'));
+
+    socket.on('peer-joined', async () => {
+      log('Có người vào phòng, tạo offer');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { room, sdp: offer });
+    });
+
+    socket.on('offer', async ({ sdp }) => {
+      log('Nhận offer, tạo answer');
+      await pc.setRemoteDescription(sdp);
+      await flushPending();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('answer', { room, sdp: answer });
+    });
+
+    socket.on('answer', async ({ sdp }) => {
+      log('Nhận answer');
+      await pc.setRemoteDescription(sdp);
+      await flushPending();
+    });
+
+    socket.on('ice-candidate', ({ candidate }) => {
+        const info = parseCandidate(candidate);
+        log(`Remote ICE candidate: type=${info.type} protocol=${info.protocol} address=${info.address}:${info.port}`);
+        addRemoteCandidate(candidate);
+    });
+  </script>
+</body>
+</html>
