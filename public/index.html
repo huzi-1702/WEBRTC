@@ -6,6 +6,16 @@
   <title>MeetLite</title>
   <link rel="icon" href="data:,">
   <style>
+    #chat { margin: 12px 0; max-width: 600px; }
+    #chatLog {
+      height: 160px; overflow: auto; border: 1px solid #ccc; border-radius: 8px;
+      padding: 8px; font-size: 14px; background: #fafafa;
+    }
+    .msg.mine { color: #0b57d0; }
+    .msg.sys { color: #888; font-style: italic; }
+    #chatRow { display: flex; gap: 8px; margin-top: 8px; }
+    #chatInput { flex: 1; padding: 6px 8px; }
+
     body { font-family: system-ui, sans-serif; margin: 16px; }
     #roomInfo { margin-bottom: 12px; font-size: 14px; }
     .videos { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -34,6 +44,13 @@
   </div>
 
   <div id="status"></div>
+  <div id="chat">
+  <div id="chatLog"></div>
+  <div id="chatRow">
+    <input id="chatInput" placeholder="Nhập tin nhắn rồi nhấn Enter..." maxlength="500">
+    <button id="btnSend">Gửi</button>
+  </div>
+</div>
   <div>
     <button id="btnSdp">In SDP ra log</button>
     <button id="btnClear">Xóa log</button>
@@ -84,6 +101,69 @@
       ).join('  |  ');
     }
     renderStatus();
+    // ---------- Chat qua DataChannel ----------
+const chatLog = document.getElementById('chatLog');
+const chatInput = document.getElementById('chatInput');
+
+function addChatMsg(name, text, mine) {
+  const row = document.createElement('div');
+  row.className = 'msg' + (mine ? ' mine' : '');
+  const who = document.createElement('b');
+  who.textContent = name + ': ';
+  const body = document.createElement('span');
+  body.textContent = text;            // textContent, không dùng innerHTML (chống XSS)
+  row.append(who, body);
+  chatLog.appendChild(row);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function addSystemMsg(text) {
+  const row = document.createElement('div');
+  row.className = 'msg sys';
+  row.textContent = text;
+  chatLog.appendChild(row);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function setupChannel(id, peer, dc) {
+  peer.dc = dc;
+  dc.onopen = () => {
+    log(id, `DataChannel "${dc.label}" đã mở (id=${dc.id}, ordered=${dc.ordered})`);
+    addSystemMsg(`${short(id)} đã kết nối chat`);
+  };
+  dc.onclose = () => log(id, 'DataChannel đã đóng');
+  dc.onerror = (e) => log(id, 'DataChannel lỗi: ' + (e.error && e.error.message));
+  dc.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type !== 'chat' || typeof msg.text !== 'string') return;
+    // Giới hạn độ dài vì dữ liệu từ peer là dữ liệu không đáng tin
+    addChatMsg(String(msg.name || short(id)).slice(0, 20), msg.text.slice(0, 500), false);
+  };
+}
+
+function sendChat() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  const payload = JSON.stringify({
+    type: 'chat',
+    name: socket.id ? short(socket.id) : 'Ẩn danh',
+    text,
+    ts: Date.now(),
+  });
+  let sent = 0;
+  peers.forEach((p) => {
+    if (p.dc && p.dc.readyState === 'open') { p.dc.send(payload); sent++; }
+  });
+  addChatMsg('Bạn', text, true);
+  if (sent === 0) addSystemMsg('Chưa có ai nhận được tin nhắn (chưa có kết nối)');
+  log(null, `Gửi chat tới ${sent} peer qua DataChannel`);
+  chatInput.value = '';
+}
+
+document.getElementById('btnSend').onclick = sendChat;
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+
 
     document.getElementById('btnClear').onclick = () => { logEl.textContent = ''; };
     document.getElementById('btnSdp').onclick = () => {
@@ -124,37 +204,44 @@
     }
 
     // ---------- Tạo / xóa kết nối tới một người ----------
-    function createPeer(id) {
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      const peer = { pc, pending: [], remoteSet: false };
-      peers.set(id, peer);
-      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    function createPeer(id, isOfferer = false) {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const peer = { pc, pending: [], remoteSet: false, dc: null };
+  peers.set(id, peer);
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
 
-      pc.onsignalingstatechange = () => log(id, `signalingState: ${pc.signalingState}`);
-      pc.onicegatheringstatechange = () => log(id, `iceGatheringState: ${pc.iceGatheringState}`);
-      pc.oniceconnectionstatechange = () => { log(id, `iceConnectionState: ${pc.iceConnectionState}`); renderStatus(); };
-      pc.onconnectionstatechange = () => {
-        log(id, `connectionState: ${pc.connectionState}`);
-        renderStatus();
-        if (pc.connectionState === 'connected') logSelectedPair(id, pc);
-      };
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          const i = parseCandidate(e.candidate);
-          log(id, `Local ICE candidate: type=${i.type} protocol=${i.protocol} address=${i.address}:${i.port}`);
-          socket.emit('ice-candidate', { to: id, candidate: e.candidate });
-        } else {
-          log(id, 'Local ICE gathering finished');
-        }
-      };
-      pc.ontrack = (e) => {
-        log(id, `Nhận track từ xa: kind=${e.track.kind}`);
-        attachVideo(id, e.streams[0]);
-      };
+  // DataChannel: bên tạo offer tạo kênh, bên trả answer nhận kênh
+  if (isOfferer) {
+    setupChannel(id, peer, pc.createDataChannel('chat'));
+  } else {
+    pc.ondatachannel = (e) => setupChannel(id, peer, e.channel);
+  }
 
-      renderStatus();
-      return peer;
+  pc.onsignalingstatechange = () => log(id, `signalingState: ${pc.signalingState}`);
+  pc.onicegatheringstatechange = () => log(id, `iceGatheringState: ${pc.iceGatheringState}`);
+  pc.oniceconnectionstatechange = () => { log(id, `iceConnectionState: ${pc.iceConnectionState}`); renderStatus(); };
+  pc.onconnectionstatechange = () => {
+    log(id, `connectionState: ${pc.connectionState}`);
+    renderStatus();
+    if (pc.connectionState === 'connected') logSelectedPair(id, pc);
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      const i = parseCandidate(e.candidate);
+      log(id, `Local ICE candidate: type=${i.type} protocol=${i.protocol} address=${i.address}:${i.port}`);
+      socket.emit('ice-candidate', { to: id, candidate: e.candidate });
+    } else {
+      log(id, 'Local ICE gathering finished');
     }
+  };
+  pc.ontrack = (e) => {
+    log(id, `Nhận track từ xa: kind=${e.track.kind}`);
+    attachVideo(id, e.streams[0]);
+  };
+
+  renderStatus();
+  return peer;
+}
 
     function removePeer(id) {
       const peer = peers.get(id);
@@ -183,14 +270,14 @@
       localStream.getTracks().forEach((t) => t.stop()); // tắt camera/micro
       document.getElementById('local').srcObject = null;
     });
-    
+
     socket.on('invalid-room', () => log(null, 'Server từ chối mã phòng không hợp lệ'));   // <-- DÒNG MỚI
 
     // Người mới vào: tạo offer cho từng người đang có trong phòng
     socket.on('room-users', async (ids) => {
       log(null, `Trong phòng đang có ${ids.length} người khác`);
       for (const id of ids) {
-        const peer = createPeer(id);
+        const peer = createPeer(id, true);
         const offer = await peer.pc.createOffer();
         await peer.pc.setLocalDescription(offer);
         log(id, 'Gửi offer');
